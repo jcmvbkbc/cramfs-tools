@@ -78,6 +78,7 @@ static char *filename;		/* ROM image filename */
 struct cramfs_super super;	/* just find the cramfs superblock once */
 static int opt_verbose = 0;	/* 1 = verbose (-v), 2+ = very verbose (-vv) */
 static int opt_continue = 0; /* 1 = continue on error for diagnositc / recovery */
+static int opt_translate = 0;	/* 1 = translate FS offset to a file path + in-file offset */
 static int log_errors_continue = 0; /* number of errors we encountered */
 static int log_errors_result = FSCK_OK;
 #ifdef INCLUDE_FS_TESTS
@@ -90,6 +91,7 @@ static unsigned long start_dir = ~0UL;	/* start of first non-root inode */
 static unsigned long end_dir = 0;	/* end of the directory structure */
 static unsigned long start_data = ~0UL;	/* start of the data (256 MB = max) */
 static unsigned long end_data = 0;	/* end of the data */
+static unsigned long search_offset = 0;	/* translation offset for opt_translate */
 
 /* Guarantee access to at least 8kB at a time */
 #define ROMBUFFER_BITS	13
@@ -116,6 +118,7 @@ static void __attribute__((noreturn)) usage(int status)
 		" -x dir     extract into dir\n"
 		" -v         be more verbose\n"
 		" -c         continue on failure\n"
+		" -t offset  translate FS offset to file name and in-file offset\n"
 		" file       file to test\n", progname);
 
 	exit(status);
@@ -373,13 +376,15 @@ static int uncompress_block(void *src, int len)
 }
 
 static int read_block(unsigned long offset, unsigned int block_nr,
-		      unsigned long size)
+		      unsigned long size, unsigned long *out_block_start)
 {
 	unsigned long blkptr_offset = offset + block_nr * 4;
 	u32 maxblock = (size + PAGE_SIZE - 1) / PAGE_SIZE;
 	u32 block_ptr, block_start, block_len, out;
 	int uncompressed, direct;
 
+	if (out_block_start)
+		*out_block_start = ~0ul;
 	if (offset < start_data)
 		start_data = offset;
 
@@ -460,6 +465,8 @@ static int read_block(unsigned long offset, unsigned int block_nr,
 			       direct ? "direct " : "",
 			       block_start, block_start + block_len, block_len);
 		memcpy(outbuffer, romfs_read(block_start), block_len);
+		if (out_block_start)
+			*out_block_start = block_start;
 		out = block_len;
 	} else {
 		if (opt_verbose > 1)
@@ -475,9 +482,11 @@ static void do_extract(char *path, int fd, unsigned long offset, unsigned long s
 {
 	unsigned long left = size;
 	unsigned int block_nr = 0;
+	unsigned long file_offset = 0;
+	unsigned long block_start;
 
 	do {
-		unsigned long out = read_block(offset, block_nr, size);
+		unsigned long out = read_block(offset, block_nr, size, &block_start);
 		if (left >= PAGE_SIZE) {
 			if (out != PAGE_SIZE)
 				die(FSCK_UNCORRECTED, 0, "non-block (%ld) bytes", out);
@@ -485,7 +494,13 @@ static void do_extract(char *path, int fd, unsigned long offset, unsigned long s
 			if (out != left)
 				die(FSCK_UNCORRECTED, 0, "non-size (%ld vs %ld) bytes", out, left);
 		}
+		if (opt_translate &&
+		    block_start != ~0ul &&
+		    search_offset >= block_start && search_offset < block_start + out)
+			printf("search_offset 0x%lx -> file '%s' offset 0x%lx\n",
+			       search_offset, path, file_offset + search_offset - block_start);
 		left -= out;
+		file_offset += out;
 		if (opt_extract) {
 			if (write(fd, outbuffer, out) < 0) {
 				die(FSCK_ERROR, 1, "write failed: %s", path);
@@ -630,7 +645,7 @@ static void do_symlink(char *path, struct cramfs_inode *i)
 	/* verbosity hack to provide proper output ordering */
 	orig_opt_verbose = opt_verbose;
 	opt_verbose = 0;
-	size = read_block(offset, 0, i->size);
+	size = read_block(offset, 0, i->size, NULL);
 	opt_verbose = orig_opt_verbose;
 	if (size != i->size) {
 		die(FSCK_UNCORRECTED, 0, "size error in symlink: %s", path);
@@ -643,7 +658,7 @@ static void do_symlink(char *path, struct cramfs_inode *i)
 		print_node('l', i, str);
 		free(str);
 		/* once again with verbose on */
-		read_block(offset, 0, i->size);
+		read_block(offset, 0, i->size, NULL);
 	}
 	if (opt_extract) {
 		if (symlink(outbuffer, path) < 0) {
@@ -753,7 +768,7 @@ int main(int argc, char **argv)
 		progname = argv[0];
 
 	/* command line options */
-	while ((c = getopt(argc, argv, "hx:vc")) != EOF) {
+	while ((c = getopt(argc, argv, "hx:vct:")) != EOF) {
 		switch (c) {
 		case 'h':
 			usage(FSCK_OK);
@@ -770,6 +785,10 @@ int main(int argc, char **argv)
 			break;
 		case 'c':
 			opt_continue++;
+			break;
+		case 't':
+			opt_translate++;
+			search_offset = strtoul(optarg, NULL, 0);
 			break;
 		}
 	}
